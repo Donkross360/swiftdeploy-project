@@ -1,0 +1,3 @@
+# Rendered artifacts (reproducible via ./swiftdeploy init)
+generated/*
+

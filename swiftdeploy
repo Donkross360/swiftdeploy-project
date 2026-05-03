@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve paths relative to this script so commands work from any cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANIFEST_PATH="$SCRIPT_DIR/manifest.yaml"
+TEMPLATES_DIR="$SCRIPT_DIR/templates"
+GENERATED_DIR="$SCRIPT_DIR/generated"
+
+# log prints standard operator-facing progress lines.
+log() {
+  printf '[SWIFTDEPLOY] %s\n' "$1"
+}
+
+# die prints a fatal error and exits non-zero.
+die() {
+  printf '[SWIFTDEPLOY][ERROR] %s\n' "$1" >&2
+  exit 1
+}
+
+# require_file guards commands from continuing with missing inputs.
+require_file() {
+  local path="$1"
+  [[ -f "$path" ]] || die "required file not found: $path"
+}
+
+# Read one scalar value from manifest.yaml using a section+key pair.
+# This intentionally targets manifest schema.
+manifest_get() {
+  local section="$1"
+  local key="$2"
+  local value
+  value="$(
+    awk -v target_section="$section" -v target_key="$key" '
+      BEGIN { in_section=0 }
+      /^[[:space:]]*#/ { next }
+      /^[a-zA-Z0-9_]+:[[:space:]]*$/ {
+        current=$0
+        sub(/:.*/, "", current)
+        in_section=(current == target_section)
+        next
+      }
+      in_section && $0 ~ "^[[:space:]]+" target_key ":[[:space:]]*" {
+        line=$0
+        sub(/^[[:space:]]+/, "", line)
+        sub(target_key ":[[:space:]]*", "", line)
+        sub(/[[:space:]]+#.*/, "", line)
+        gsub(/^["'\''"]|["'\''"]$/, "", line)
+        print line
+        exit
+      }
+    ' "$MANIFEST_PATH"
+  )"
+
+  [[ -n "$value" ]] || die "missing manifest key: ${section}.${key}"
+  printf '%s' "$value"
+}
+
+render_template() {
+  local template_path="$1"
+  local output_path="$2"
+  shift 2
+
+  # Copy template first, then apply token replacements in-place.
+  cp "$template_path" "$output_path"
+  while (($#)); do
+    local token="$1"
+    local replacement="$2"
+    shift 2
+    local safe_replacement
+    safe_replacement="$(printf '%s' "$replacement" | sed -e 's/[\/&]/\\&/g')"
+    sed -i "s|{{$token}}|$safe_replacement|g" "$output_path"
+  done
+
+  # Fail if any placeholder survives rendering to avoid partial configs.
+  if grep -Eq '\{\{[A-Z0-9_]+\}\}' "$output_path"; then
+    die "unresolved template token(s) in $output_path"
+  fi
+}
+
+# init_cmd renders all generated artifacts from manifest + templates.
+init_cmd() {
+  require_file "$MANIFEST_PATH"
+  require_file "$TEMPLATES_DIR/nginx.conf.tmpl"
+  require_file "$TEMPLATES_DIR/docker-compose.yml.tmpl"
+
+  mkdir -p "$GENERATED_DIR"
+
+  local app_image app_port app_mode app_version
+  local nginx_image nginx_port proxy_timeout
+  local network_name network_driver logs_volume restart_policy
+
+  app_image="$(manifest_get services image)"
+  app_port="$(manifest_get services port)"
+  app_mode="$(manifest_get services mode)"
+  app_version="$(manifest_get services version)"
+
+  nginx_image="$(manifest_get nginx image)"
+  nginx_port="$(manifest_get nginx port)"
+  proxy_timeout="$(manifest_get nginx proxy_timeout)"
+
+  network_name="$(manifest_get network name)"
+  network_driver="$(manifest_get network driver_type)"
+  logs_volume="$(manifest_get logs volume_name)"
+  restart_policy="$(manifest_get deploy restart_policy)"
+
+  render_template \
+    "$TEMPLATES_DIR/nginx.conf.tmpl" \
+    "$GENERATED_DIR/nginx.conf" \
+    "NGINX_PORT" "$nginx_port" \
+    "APP_SERVICE_NAME" "app" \
+    "APP_PORT" "$app_port" \
+    "PROXY_TIMEOUT" "$proxy_timeout"
+
+  render_template \
+    "$TEMPLATES_DIR/docker-compose.yml.tmpl" \
+    "$GENERATED_DIR/docker-compose.yml" \
+    "APP_IMAGE" "$app_image" \
+    "APP_MODE" "$app_mode" \
+    "APP_VERSION" "$app_version" \
+    "RESTART_POLICY" "$restart_policy" \
+    "NETWORK_NAME" "$network_name" \
+    "NGINX_IMAGE" "$nginx_image" \
+    "NGINX_PORT" "$nginx_port" \
+    "LOGS_VOLUME_NAME" "$logs_volume" \
+    "NETWORK_DRIVER" "$network_driver"
+
+  log "init complete: generated/nginx.conf and generated/docker-compose.yml"
+}
+
+cmd="${1:-}"
+
+# Command dispatcher for lifecycle actions.
+case "$cmd" in
+  init)
+    init_cmd
+    ;;
+  validate|deploy|promote|teardown)
+    echo "TODO: implement '$cmd'"
+    ;;
+  *)
+    echo "Usage: ./swiftdeploy {init|validate|deploy|promote <stable|canary>|teardown [--clean]}"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,23 @@
+services:
+  image: swiftdeploy-api-go:latest
+  port: 3000
+  mode: stable
+  version: "1.0.0"
+
+nginx:
+  image: nginxinc/nginx-unprivileged:stable-alpine
+  port: 8080
+  proxy_timeout: 30s
+  error_service_name: swift-api
+  error_contact: ops@example.com
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
+
+logs:
+  volume_name: swiftdeploy-logs
+
+deploy:
+  restart_policy: unless-stopped
+  health_timeout_seconds: 60
