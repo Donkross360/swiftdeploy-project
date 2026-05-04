@@ -2,13 +2,13 @@ services:
   image: swiftdeploy-api-go:latest
   port: 3000
   mode: stable
-  version: "1.0.0"
+  app_version: "1.0.0"
 
 nginx:
-  image: nginxinc/nginx-unprivileged:stable-alpine
+  image: nginx:latest
   port: 8080
   proxy_timeout: 30s
-  error_service_name: swift-api
+  error_service_name: swiftdeploy-api
   error_contact: ops@example.com
 
 network:
