@@ -5,11 +5,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_PATH="$SCRIPT_DIR/manifest.yaml"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
-GENERATED_DIR="$SCRIPT_DIR/generated"
+OUTPUT_DIR_NAME="${SWIFTDEPLOY_OUT_DIR:-template-output}"
+if [[ "$OUTPUT_DIR_NAME" = /* ]]; then
+  GENERATED_DIR="$OUTPUT_DIR_NAME"
+else
+  GENERATED_DIR="$SCRIPT_DIR/$OUTPUT_DIR_NAME"
+fi
+CHECK_ERROR=""
 
 # log prints standard operator-facing progress lines.
 log() {
   printf '[SWIFTDEPLOY] %s\n' "$1"
+}
+
+# hint prints actionable next-step guidance.
+hint() {
+  printf '[HINT] %s\n' "$1"
 }
 
 # die prints a fatal error and exits non-zero.
@@ -24,13 +35,19 @@ require_file() {
   [[ -f "$path" ]] || die "required file not found: $path"
 }
 
+set_check_error() {
+  CHECK_ERROR="$1"
+}
+
 # Read one scalar value from manifest.yaml using a section+key pair.
 # This intentionally targets manifest schema.
-manifest_get() {
+manifest_try_get() {
   local section="$1"
   local key="$2"
   local value
   value="$(
+    # We intentionally parse a flat, known schema instead of a generic YAML parser
+    # so the CLI remains dependency-free.
     awk -v target_section="$section" -v target_key="$key" '
       BEGIN { in_section=0 }
       /^[[:space:]]*#/ { next }
@@ -52,7 +69,15 @@ manifest_get() {
     ' "$MANIFEST_PATH"
   )"
 
-  [[ -n "$value" ]] || die "missing manifest key: ${section}.${key}"
+  [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+}
+
+manifest_get() {
+  local section="$1"
+  local key="$2"
+  local value
+  value="$(manifest_try_get "$section" "$key")" || die "missing manifest key: ${section}.${key}"
   printf '%s' "$value"
 }
 
@@ -68,6 +93,7 @@ render_template() {
     local replacement="$2"
     shift 2
     local safe_replacement
+    # Escape sed-sensitive characters to avoid breaking rendered configs.
     safe_replacement="$(printf '%s' "$replacement" | sed -e 's/[\/&]/\\&/g')"
     sed -i "s|{{$token}}|$safe_replacement|g" "$output_path"
   done
@@ -87,17 +113,20 @@ init_cmd() {
   mkdir -p "$GENERATED_DIR"
 
   local app_image app_port app_mode app_version
-  local nginx_image nginx_port proxy_timeout
+  local nginx_image nginx_port proxy_timeout error_service_name error_contact
   local network_name network_driver logs_volume restart_policy
 
+  # Resolve every manifest input up front so failures are explicit and early.
   app_image="$(manifest_get services image)"
   app_port="$(manifest_get services port)"
   app_mode="$(manifest_get services mode)"
-  app_version="$(manifest_get services version)"
+  app_version="$(manifest_get services app_version)"
 
   nginx_image="$(manifest_get nginx image)"
   nginx_port="$(manifest_get nginx port)"
   proxy_timeout="$(manifest_get nginx proxy_timeout)"
+  error_service_name="$(manifest_get nginx error_service_name)"
+  error_contact="$(manifest_get nginx error_contact)"
 
   network_name="$(manifest_get network name)"
   network_driver="$(manifest_get network driver_type)"
@@ -110,7 +139,9 @@ init_cmd() {
     "NGINX_PORT" "$nginx_port" \
     "APP_SERVICE_NAME" "app" \
     "APP_PORT" "$app_port" \
-    "PROXY_TIMEOUT" "$proxy_timeout"
+    "PROXY_TIMEOUT" "$proxy_timeout" \
+    "ERROR_SERVICE_NAME" "$error_service_name" \
+    "ERROR_CONTACT" "$error_contact"
 
   render_template \
     "$TEMPLATES_DIR/docker-compose.yml.tmpl" \
@@ -118,6 +149,7 @@ init_cmd() {
     "APP_IMAGE" "$app_image" \
     "APP_MODE" "$app_mode" \
     "APP_VERSION" "$app_version" \
+    "APP_PORT" "$app_port" \
     "RESTART_POLICY" "$restart_policy" \
     "NETWORK_NAME" "$network_name" \
     "NGINX_IMAGE" "$nginx_image" \
@@ -125,21 +157,416 @@ init_cmd() {
     "LOGS_VOLUME_NAME" "$logs_volume" \
     "NETWORK_DRIVER" "$network_driver"
 
-  log "init complete: generated/nginx.conf and generated/docker-compose.yml"
+  log "init complete: ${OUTPUT_DIR_NAME}/nginx.conf and ${OUTPUT_DIR_NAME}/docker-compose.yml"
+}
+
+run_check() {
+  local label="$1"
+  shift
+  CHECK_ERROR=""
+  if "$@"; then
+    printf '[PASS] %s\n' "$label"
+    return 0
+  fi
+
+  if [[ -n "$CHECK_ERROR" ]]; then
+    printf '[FAIL] %s (%s)\n' "$label" "$CHECK_ERROR"
+  else
+    printf '[FAIL] %s\n' "$label"
+  fi
+  return 1
+}
+
+check_manifest_yaml() {
+  if [[ ! -f "$MANIFEST_PATH" ]]; then
+    set_check_error "manifest.yaml not found"
+    return 1
+  fi
+
+  # First, perform a real YAML parse when a parser is available.
+  if command -v python3 >/dev/null 2>&1 && python3 - <<'PY' "$MANIFEST_PATH" >/dev/null 2>&1
+import sys
+try:
+    import yaml  # type: ignore
+except Exception:
+    raise SystemExit(2)
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    yaml.safe_load(f)
+PY
+  then
+    :
+  elif command -v ruby >/dev/null 2>&1 && ruby -e 'require "yaml"; YAML.safe_load(File.read(ARGV[0]), aliases: true)' "$MANIFEST_PATH" >/dev/null 2>&1; then
+    :
+  else
+    # Fallback: enforce expected section layout for dependency-free environments.
+    if ! awk '
+    /^[[:space:]]*#/ { next }
+    /^[a-zA-Z0-9_]+:[[:space:]]*$/ {
+      sec=$0
+      sub(/:.*/, "", sec)
+      seen[sec]=1
+    }
+    END {
+      required[1]="services"
+      required[2]="nginx"
+      required[3]="network"
+      required[4]="logs"
+      required[5]="deploy"
+      for (i=1; i<=5; i++) {
+        if (!seen[required[i]]) exit 1
+      }
+      exit 0
+    }
+    ' "$MANIFEST_PATH"; then
+      set_check_error "manifest is unreadable and no YAML parser found (install python3+pyyaml or ruby)"
+      return 1
+    fi
+  fi
+
+  # Require expected top-level sections regardless of parser path used above.
+  if awk '
+    /^[[:space:]]*#/ { next }
+    /^[a-zA-Z0-9_]+:[[:space:]]*$/ {
+      sec=$0
+      sub(/:.*/, "", sec)
+      seen[sec]=1
+    }
+    END {
+      required[1]="services"
+      required[2]="nginx"
+      required[3]="network"
+      required[4]="logs"
+      required[5]="deploy"
+      for (i=1; i<=5; i++) {
+        if (!seen[required[i]]) exit 1
+      }
+      exit 0
+    }
+  ' "$MANIFEST_PATH"; then
+    return 0
+  fi
+
+  set_check_error "missing required top-level section(s)"
+  return 1
+}
+
+check_required_fields() {
+  local fields=(
+    "services image"
+    "services port"
+    "services mode"
+    "services app_version"
+    "nginx image"
+    "nginx port"
+    "nginx proxy_timeout"
+    "network name"
+    "network driver_type"
+    "logs volume_name"
+    "deploy restart_policy"
+    "deploy health_timeout_seconds"
+  )
+
+  local pair section key value
+  for pair in "${fields[@]}"; do
+    section="${pair%% *}"
+    key="${pair##* }"
+    value="$(manifest_try_get "$section" "$key" || true)"
+    if [[ -z "$value" ]]; then
+      set_check_error "missing or empty ${section}.${key}"
+      return 1
+    fi
+  done
+
+  local app_mode
+  app_mode="$(manifest_try_get services mode || true)"
+  if [[ "$app_mode" != "stable" && "$app_mode" != "canary" ]]; then
+    set_check_error "services.mode must be stable or canary"
+    return 1
+  fi
+
+  return 0
+}
+
+check_image_exists() {
+  if ! command -v docker >/dev/null 2>&1; then
+    set_check_error "docker command not found (install/start Docker, then re-run validate)"
+    return 1
+  fi
+
+  local app_image
+  app_image="$(manifest_try_get services image || true)"
+  if [[ -z "$app_image" ]]; then
+    set_check_error "services.image is missing"
+    return 1
+  fi
+
+  if docker image inspect "$app_image" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  set_check_error "docker image not found locally: $app_image (run ./swiftdeploy build && ./swiftdeploy validate)"
+  return 1
+}
+
+build_cmd() {
+  if ! command -v docker >/dev/null 2>&1; then
+    die "docker command not found"
+  fi
+
+  require_file "$MANIFEST_PATH"
+  require_file "$SCRIPT_DIR/Dockerfile"
+
+  local app_image
+  app_image="$(manifest_get services image)"
+
+  log "building image: $app_image"
+  if ! docker build -t "$app_image" "$SCRIPT_DIR"; then
+    hint "review Dockerfile and app/ sources, then retry: ./swiftdeploy build"
+    die "build failed for image: $app_image"
+  fi
+  log "build complete: $app_image"
+}
+
+compose_cmd() {
+  docker compose -f "$GENERATED_DIR/docker-compose.yml" -p swiftdeploy "$@"
+}
+
+update_manifest_mode() {
+  local target_mode="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  awk -v target_mode="$target_mode" '
+    BEGIN { in_services=0 }
+    /^[a-zA-Z0-9_]+:[[:space:]]*$/ {
+      sec=$0
+      sub(/:.*/, "", sec)
+      in_services=(sec == "services")
+    }
+    in_services && /^[[:space:]]+mode:[[:space:]]*/ {
+      print "  mode: " target_mode
+      next
+    }
+    { print }
+  ' "$MANIFEST_PATH" >"$tmp_file"
+
+  mv "$tmp_file" "$MANIFEST_PATH"
+}
+
+wait_for_health() {
+  local timeout_seconds="$1"
+  local nginx_port
+  nginx_port="$(manifest_get nginx port)"
+  local deadline=$((SECONDS + timeout_seconds))
+
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl command not found (required for health checks)"
+  fi
+
+  while ((SECONDS < deadline)); do
+    local body
+    body="$(curl -fsS "http://127.0.0.1:${nginx_port}/healthz" 2>/dev/null || true)"
+    if [[ -n "$body" ]]; then
+      local compact
+      compact="$(printf '%s' "$body" | tr -d '[:space:]')"
+      if [[ "$compact" == *'"status":"ok"'* ]]; then
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+
+  return 1
+}
+
+deploy_cmd() {
+  local health_timeout
+  health_timeout="$(manifest_get deploy health_timeout_seconds)"
+
+  log "deploy: rendering configs"
+  init_cmd
+
+  if ! check_image_exists; then
+    log "deploy: app image missing locally; running build"
+    build_cmd
+  fi
+
+  log "deploy: running preflight validation"
+  validate_cmd
+
+  log "deploy: starting stack"
+  compose_cmd up -d --remove-orphans
+
+  log "deploy: waiting for healthz readiness (timeout: ${health_timeout}s)"
+  if ! wait_for_health "$health_timeout"; then
+    hint "inspect container logs: docker compose -f ${OUTPUT_DIR_NAME}/docker-compose.yml -p swiftdeploy logs"
+    die "deploy failed: health check timeout after ${health_timeout}s"
+  fi
+
+  log "deploy complete: stack is healthy"
+}
+
+promote_cmd() {
+  local target_mode="${1:-}"
+  [[ "$target_mode" == "stable" || "$target_mode" == "canary" ]] || die "usage: ./swiftdeploy promote <stable|canary>"
+
+  local health_timeout
+  health_timeout="$(manifest_get deploy health_timeout_seconds)"
+
+  log "promote: updating manifest mode to ${target_mode}"
+  update_manifest_mode "$target_mode"
+
+  log "promote: regenerating configs from updated manifest"
+  init_cmd
+
+  log "promote: restarting app container only"
+  compose_cmd up -d --no-deps --force-recreate app
+
+  log "promote: waiting for /healthz"
+  if ! wait_for_health "$health_timeout"; then
+    hint "inspect app logs: docker compose -f ${OUTPUT_DIR_NAME}/docker-compose.yml -p swiftdeploy logs app"
+    die "promote failed: health check timeout after ${health_timeout}s"
+  fi
+
+  local nginx_port mode_header
+  nginx_port="$(manifest_get nginx port)"
+  mode_header="$(curl -sS -D - -o /dev/null "http://127.0.0.1:${nginx_port}/healthz" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-mode" {print $2}' || true)"
+  if [[ "$target_mode" == "canary" && "$mode_header" != "canary" ]]; then
+    die "promote verification failed: expected X-Mode=canary on /healthz"
+  fi
+  if [[ "$target_mode" == "stable" && -n "$mode_header" ]]; then
+    die "promote verification failed: expected no X-Mode header in stable mode"
+  fi
+
+  log "promote complete: mode=${target_mode} verified via /healthz"
+}
+
+teardown_cmd() {
+  local clean_flag="${1:-}"
+
+  log "teardown: removing containers, network, and volumes"
+  if [[ -f "$GENERATED_DIR/docker-compose.yml" ]]; then
+    compose_cmd down -v --remove-orphans || true
+  else
+    log "teardown: generated compose file not found, skipping compose down"
+  fi
+
+  if [[ "$clean_flag" == "--clean" ]]; then
+    log "teardown: removing generated configs"
+    rm -f "$GENERATED_DIR/nginx.conf" "$GENERATED_DIR/docker-compose.yml"
+  elif [[ -n "$clean_flag" ]]; then
+    die "usage: ./swiftdeploy teardown [--clean]"
+  fi
+
+  log "teardown complete"
+}
+
+check_nginx_port_available() {
+  if ! command -v ss >/dev/null 2>&1; then
+    set_check_error "ss command not found"
+    return 1
+  fi
+
+  local nginx_port
+  nginx_port="$(manifest_try_get nginx port || true)"
+  if [[ -z "$nginx_port" ]]; then
+    set_check_error "nginx.port is missing"
+    return 1
+  fi
+
+  if ss -ltn | awk -v p=":${nginx_port}$" 'NR > 1 && $4 ~ p { found=1 } END { exit found ? 0 : 1 }'; then
+    set_check_error "port ${nginx_port} is already in use"
+    return 1
+  fi
+
+  return 0
+}
+
+check_nginx_syntax() {
+  if ! command -v docker >/dev/null 2>&1; then
+    set_check_error "docker command not found (install/start Docker, then re-run validate)"
+    return 1
+  fi
+
+  local nginx_image
+  nginx_image="$(manifest_try_get nginx image || true)"
+  if [[ -z "$nginx_image" ]]; then
+    set_check_error "nginx.image is missing"
+    return 1
+  fi
+
+  if [[ ! -f "$GENERATED_DIR/nginx.conf" ]]; then
+    set_check_error "${OUTPUT_DIR_NAME}/nginx.conf not found (run ./swiftdeploy init)"
+    return 1
+  fi
+
+  if docker run --rm -v "$GENERATED_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t >/dev/null 2>&1; then
+    return 0
+  fi
+
+  set_check_error "nginx config syntax check failed"
+  return 1
+}
+
+validate_cmd() {
+  local failures=0
+
+  # Keep generated artifacts synchronized before preflight checks.
+  if ! init_cmd >/dev/null; then
+    die "validate pre-step failed: unable to generate configs from manifest"
+  fi
+
+  # Keep check order stable so output is predictable for operators and screenshots.
+  if ! run_check "1) manifest.yaml exists + valid YAML structure" check_manifest_yaml; then
+    failures=$((failures + 1))
+  fi
+  if ! run_check "2) required fields present and non-empty" check_required_fields; then
+    failures=$((failures + 1))
+  fi
+  if ! run_check "3) referenced Docker image exists locally" check_image_exists; then
+    failures=$((failures + 1))
+  fi
+  if ! run_check "4) nginx host port not already in use" check_nginx_port_available; then
+    failures=$((failures + 1))
+  fi
+  if ! run_check "5) generated nginx.conf syntax valid" check_nginx_syntax; then
+    failures=$((failures + 1))
+  fi
+
+  if (( failures > 0 )); then
+    hint "resolve failed checks above, then re-run: ./swiftdeploy validate"
+    die "validate failed with ${failures} failing check(s)"
+  fi
+
+  log "validate complete: all checks passed"
 }
 
 cmd="${1:-}"
+subarg="${2:-}"
 
 # Command dispatcher for lifecycle actions.
 case "$cmd" in
   init)
     init_cmd
     ;;
-  validate|deploy|promote|teardown)
-    echo "TODO: implement '$cmd'"
+  validate)
+    validate_cmd
+    ;;
+  build)
+    build_cmd
+    ;;
+  deploy)
+    deploy_cmd
+    ;;
+  promote)
+    promote_cmd "$subarg"
+    ;;
+  teardown)
+    teardown_cmd "$subarg"
     ;;
   *)
-    echo "Usage: ./swiftdeploy {init|validate|deploy|promote <stable|canary>|teardown [--clean]}"
+    echo "Usage: ./swiftdeploy {init|validate|build|deploy|promote <stable|canary>|teardown [--clean]}"
     exit 1
     ;;
 esac

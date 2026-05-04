@@ -9,12 +9,34 @@ http {
   default_type application/octet-stream;
   sendfile on;
   keepalive_timeout 65;
+  log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
+  access_log /var/log/nginx/access.log swiftdeploy;
 
   server {
     listen {{NGINX_PORT}};
     server_name _;
 
     add_header X-Deployed-By swiftdeploy always;
+    proxy_intercept_errors on;
+
+    error_page 502 /__swiftdeploy_502.json;
+    error_page 503 /__swiftdeploy_503.json;
+    error_page 504 /__swiftdeploy_504.json;
+
+    location = /__swiftdeploy_502.json {
+      default_type application/json;
+      return 502 '{"error":"bad_gateway","code":"502","service":"{{ERROR_SERVICE_NAME}}","contact":"{{ERROR_CONTACT}}"}';
+    }
+
+    location = /__swiftdeploy_503.json {
+      default_type application/json;
+      return 503 '{"error":"service_unavailable","code":"503","service":"{{ERROR_SERVICE_NAME}}","contact":"{{ERROR_CONTACT}}"}';
+    }
+
+    location = /__swiftdeploy_504.json {
+      default_type application/json;
+      return 504 '{"error":"gateway_timeout","code":"504","service":"{{ERROR_SERVICE_NAME}}","contact":"{{ERROR_CONTACT}}"}';
+    }
 
     location / {
       proxy_pass http://{{APP_SERVICE_NAME}}:{{APP_PORT}};
@@ -22,7 +44,10 @@ http {
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_pass_header X-Mode;
+      proxy_connect_timeout {{PROXY_TIMEOUT}};
       proxy_read_timeout {{PROXY_TIMEOUT}};
+      proxy_send_timeout {{PROXY_TIMEOUT}};
     }
   }
 }
