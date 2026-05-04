@@ -504,7 +504,7 @@ check_nginx_syntax() {
   local test_output
   # nginx -t resolves static upstream hostnames at parse time. Provide a dummy
   # host mapping so syntax validation stays focused on config correctness.
-  if test_output="$(docker run --rm --add-host app:127.0.0.1 -v "$GENERATED_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t 2>&1)"; then
+  if test_output="$(docker run --rm --add-host app:127.0.0.1 -v "$GENERATED_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t -g 'pid /tmp/nginx.pid;' 2>&1)"; then
     return 0
   fi
 
