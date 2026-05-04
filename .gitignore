@@ -1,3 +1,7 @@
 # Rendered artifacts (reproducible via ./swiftdeploy init)
-generated/*
+generated/
+swiftdeploy-generated/
+template-output/
+temp_output/
+*-generated/
 
