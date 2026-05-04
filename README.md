@@ -133,3 +133,37 @@ curl -i http://127.0.0.1:8080/healthz
   - removes containers, network, and volumes for the stack
   - with `--clean`, also removes generated config files
 
+## Troubleshooting
+
+### Nginx port already in use
+
+If `./swiftdeploy validate` fails at check `4) nginx host port not already in use`:
+
+```bash
+ss -ltnp | rg ":8080"
+```
+
+Resolve with one of these:
+
+1. Stop the conflicting process currently bound to the port:
+
+```bash
+# If it is a Docker container publishing 8080
+docker ps --format "{{.ID}}\t{{.Ports}}\t{{.Names}}" | rg "0.0.0.0:8080|:::8080"
+docker stop <container_id_or_name>
+
+# If it is a system service
+sudo systemctl stop <service-name>
+
+# If you only have a PID from ss output
+sudo kill <pid>
+```
+
+2. Change `nginx.port` in `manifest.yaml` to an unused port (for example `8081`), then rerun:
+
+```bash
+./swiftdeploy init
+./swiftdeploy validate
+./swiftdeploy deploy
+```
+

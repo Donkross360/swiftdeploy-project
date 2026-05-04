@@ -501,11 +501,13 @@ check_nginx_syntax() {
     return 1
   fi
 
-  if docker run --rm -v "$GENERATED_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t >/dev/null 2>&1; then
+  local test_output
+  if test_output="$(docker run --rm -v "$GENERATED_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t 2>&1)"; then
     return 0
   fi
 
-  set_check_error "nginx config syntax check failed"
+  test_output="$(printf '%s' "$test_output" | tr '\n' ' ' | sed -e 's/[[:space:]]\+/ /g' -e 's/^ //;s/ $//')"
+  set_check_error "nginx config syntax check failed: ${test_output}"
   return 1
 }
 
