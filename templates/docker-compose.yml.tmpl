@@ -24,7 +24,6 @@ services:
   nginx:
     image: {{NGINX_IMAGE}}
     container_name: swiftdeploy-nginx
-    user: "101:101"
     depends_on:
       app:
         condition: service_healthy
