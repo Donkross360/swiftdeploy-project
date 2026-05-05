@@ -1,4 +1,5 @@
 worker_processes auto;
+# Unprivileged nginx cannot write under /run, so keep pid under /tmp.
 pid /tmp/nginx.pid;
 
 events {
@@ -10,11 +11,13 @@ http {
   default_type application/octet-stream;
   sendfile on;
   keepalive_timeout 65;
+  # Unprivileged temp paths keep request buffering writable at runtime.
   client_body_temp_path /tmp/client_temp;
   proxy_temp_path /tmp/proxy_temp;
   fastcgi_temp_path /tmp/fastcgi_temp;
   uwsgi_temp_path /tmp/uwsgi_temp;
   scgi_temp_path /tmp/scgi_temp;
+  # Required access-log format for task auditing/evidence collection.
   log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
   access_log /var/log/nginx/access.log swiftdeploy;
 
@@ -23,6 +26,7 @@ http {
     server_name _;
 
     add_header X-Deployed-By swiftdeploy always;
+    # Convert upstream failures into structured JSON error payloads.
     proxy_intercept_errors on;
 
     error_page 502 /__swiftdeploy_502.json;
@@ -45,11 +49,13 @@ http {
     }
 
     location / {
+      # All public traffic enters via nginx and forwards to app service.
       proxy_pass http://{{APP_SERVICE_NAME}}:{{APP_PORT}};
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto $scheme;
+      # Forward canary mode header to clients for promote verification.
       proxy_pass_header X-Mode;
       proxy_connect_timeout {{PROXY_TIMEOUT}};
       proxy_read_timeout {{PROXY_TIMEOUT}};
