@@ -1,9 +1,11 @@
+# Service runtime settings used by image build/deploy/promote flows.
 services:
   image: swiftdeploy-api-go:latest
   port: 3000
   mode: stable
   app_version: "1.0.0"
 
+# Public ingress settings and operator-facing error metadata.
 nginx:
   image: nginxinc/nginx-unprivileged:stable-alpine
   port: 8080
@@ -11,13 +13,31 @@ nginx:
   error_service_name: swiftdeploy-api
   error_contact: ops@example.com
 
+# OPA sidecar settings for policy evaluation.
+opa:
+  image: openpolicyagent/opa:latest
+  port: 8181
+
+# Shared network settings for internal service-to-service traffic.
 network:
   name: swiftdeploy-net
   driver_type: bridge
 
+# Named volume used by nginx logs.
 logs:
   volume_name: swiftdeploy-logs
 
+# Policy data location and query timeout controls.
+policy:
+  data_file: policy-data/thresholds.json
+  decision_timeout_seconds: 5
+
+# Audit artifact paths used by status/audit commands.
+audit:
+  history_file: template-output/history.jsonl
+  report_file: audit_report.md
+
+# Deployment lifecycle defaults.
 deploy:
   restart_policy: unless-stopped
   health_timeout_seconds: 60

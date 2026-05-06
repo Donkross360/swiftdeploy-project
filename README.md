@@ -1,6 +1,11 @@
-# SwiftDeploy Project (Stage 4A)
+# SwiftDeploy Project
 
-`swiftdeploy` is a manifest-driven CLI that generates deployment configs, validates preflight requirements, and manages stack lifecycle commands for a Go API behind Nginx.
+`swiftdeploy` is a manifest-driven deployment CLI for a Go API behind Nginx, extended with Prometheus metrics and Open Policy Agent (OPA) gates plus a lightweight audit trail.
+
+## Architecture Overview
+
+![SwiftDeploy architecture](./swiftdeploy-architecture.png)
+
 
 ## Prerequisites
 
@@ -11,11 +16,12 @@ Required to run CLI workflows:
 - Bash
 - `curl`
 - `ss` (from `iproute2`)
+- `python3` (metrics/policy parsing, YAML validation fallback, audit reports)
 - One YAML parser path for strict validation:
-  - `python3` + `pyyaml`, or
+  - `python3` + `PyYAML`, or
   - `ruby` with stdlib YAML
 
-Optional for local app development (outside Docker):
+Optional for local app development outside Docker:
 
 - Go toolchain (`go`, `gofmt`)
 
@@ -23,147 +29,151 @@ Optional for local app development (outside Docker):
 
 - `manifest.yaml` - single source of truth
 - `swiftdeploy` - executable CLI script
-- `app/` - Go API service
-- `templates/` - source templates for Nginx and Compose
-- `template-output/` - default render output directory
-- `Dockerfile` - service image build
+- `app/` - Go API (`/`, `/healthz`, `/chaos`, `/metrics`)
+- `templates/` - Nginx and Compose templates (app, nginx, OPA)
+- `policies/` - Rego (`policy.infrastructure`, `policy.canary`)
+- `policy-data/` - external thresholds (`thresholds.json`) loaded by OPA
+- `template-output/` - default generated output (nginx.conf, docker-compose.yml, audit history)
+- `Dockerfile` - API image build
 
 ## Output Directory Configuration
 
-By default, generated files are written to `template-output/`.
+Default output directory: `template-output/`.
 
-You can override that directory with `SWIFTDEPLOY_OUT_DIR`:
+Override with:
 
 ```bash
 SWIFTDEPLOY_OUT_DIR=swiftdeploy-output ./swiftdeploy init
 ```
 
-If the value is relative, it is resolved from the project root.  
-If it is absolute, it is used directly.
+Relative paths resolve from the project root; absolute paths are used as given.
+
+## Core Features
+
+- **`GET /metrics`** — Prometheus text format with `http_requests_total`, `http_request_duration_seconds`, `app_uptime_seconds`, `app_mode`, `chaos_active`.
+- **OPA sidecar** — Compose binds OPA only to **`127.0.0.1:<opa.port>`** (see `manifest.yaml`). No Nginx route forwards to OPA.
+- **Policies** — Structured decisions at `policy/infrastructure/decision` and `policy/canary/decision`; thresholds read from **`data.infrastructure`** and **`data.canary`** (mounted JSON).
+- **Pre-deploy gate** (`deploy`) — Host disk/CPU snapshot → infrastructure policy → blocks with violation messages on deny.
+- **Pre-promote gate** (`promote stable` when current mode is **canary**) — Two `/metrics` scrapes through Nginx separated by **`canary.window_seconds`** → windowed error rate and p99 → canary policy → blocks on deny.
+- **`status [interval_seconds]`** — Loop: scrape metrics, evaluate both policy domains with current inputs, append JSON Lines to `audit.history_file`.
+- **`audit`** — Reads history, writes `audit.report_file` (Markdown timeline and policy notes).
+- **OPA failure handling** — Connection errors, timeouts, malformed JSON, undefined documents.
 
 ## Quick Usage
 
 ```bash
-# Build service image referenced by manifest.yaml
-./swiftdeploy build
+./swiftdeploy build          # build API image from Dockerfile
+./swiftdeploy init           # render nginx.conf + docker-compose.yml
+./swiftdeploy validate       # five preflight checks
+./swiftdeploy deploy         # init → OPA → pre-deploy gate → validate → stack up → wait for health
 
-# Generate nginx.conf and docker-compose.yml from templates
-./swiftdeploy init
+./swiftdeploy promote canary    # manifest + app restart; chaos available in canary
+./swiftdeploy promote stable    # when already canary: pre-promote gate → then mode change
 
-# Run 5 preflight checks (non-zero on any failure)
-./swiftdeploy validate
+./swiftdeploy status 5         # optional: live samples + history append (requires stack + OPA)
+./swiftdeploy audit            # generate Markdown report from history
 
-# Generate -> validate -> start stack -> wait for health
-./swiftdeploy deploy
-
-# Switch runtime mode and restart only app container
-./swiftdeploy promote canary
-./swiftdeploy promote stable
-
-# Stop stack; --clean also removes generated config files
 ./swiftdeploy teardown --clean
 ```
 
-## End-to-End Walkthrough
+Replace `8181` / `8080` below if your `manifest.yaml` uses different `opa.port` / `nginx.port`.
 
-Run from project root:
+## Quick manual checks (copy/paste)
+
+After a successful `./swiftdeploy deploy` (stack healthy):
 
 ```bash
-# 1) Build the app image declared in manifest.yaml
-./swiftdeploy build
+# Ingress: Prometheus text (must go through nginx port, not app port exposed to host).
+curl -sS "http://127.0.0.1:8080/metrics" | grep -E "http_requests_total|chaos_active|app_uptime_seconds" | head
 
-# 2) Render deployment configs from manifest.yaml
-./swiftdeploy init
-
-# 3) Run preflight checks
-./swiftdeploy validate
-
-# 4) Deploy stack and wait until /healthz is ready
-./swiftdeploy deploy
-
-# 5) Verify baseline response
-curl -s http://127.0.0.1:8080/
-curl -s http://127.0.0.1:8080/healthz
-
-# 6) Promote to canary and verify mode
-./swiftdeploy promote canary
-curl -i http://127.0.0.1:8080/healthz
-
-# 7) Exercise chaos in canary mode
-curl -s -X POST http://127.0.0.1:8080/chaos \
+# Policy allow (requires `policy/` in the URL — omitting it returns empty `{}`).
+curl -sS -X POST "http://127.0.0.1:8181/v1/data/policy/infrastructure/decision" \
   -H "Content-Type: application/json" \
-  -d '{"mode":"slow","duration":2}'
-curl -s -X POST http://127.0.0.1:8080/chaos \
+  -d '{"input":{"context":"pre-deploy","disk_free_gb":50,"cpu_load":0.3}}'
+
+curl -sS -X POST "http://127.0.0.1:8181/v1/data/policy/canary/decision" \
   -H "Content-Type: application/json" \
-  -d '{"mode":"error","rate":0.5}'
-curl -s -X POST http://127.0.0.1:8080/chaos \
+  -d '{"input":{"context":"pre-promote","window_seconds":30,"error_rate":0.001,"p99_latency_ms":100}}'
+
+# Isolation: OPA-shaped path on nginx → 404 (see section below).
+curl -sS -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8080/v1/data/policy/infrastructure/decision"
+```
+
+Canary chaos / recover (only when `services.mode` is **canary**):
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/chaos" \
   -H "Content-Type: application/json" \
   -d '{"mode":"recover"}'
-
-# 8) Promote back to stable and verify header disappears
-./swiftdeploy promote stable
-curl -i http://127.0.0.1:8080/healthz
-
-# 9) Tear down resources (and optionally generated files)
-./swiftdeploy teardown --clean
 ```
+
+If the app container is unhealthy after an image rebuild, inspect logs:
+
+```bash
+docker compose -f template-output/docker-compose.yml -p swiftdeploy logs app
+```
+
+### Policy isolation (OPA not on the public ingress port)
+
+Nginx only proxies to the app. OPA is not an upstream. The API registers exact routes (`/`, `/healthz`, `/chaos`, `/metrics`), so OPA-style paths are not served by the app.
+
+```bash
+# Through Nginx: unknown OPA-style paths should be 404 from the app.
+curl -sS -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8080/v1/data/policy/infrastructure/decision"
+```
+
+OPA remains reachable only on the host loopback binding from Compose (`127.0.0.1:8181`).
+
+## Editing Thresholds
+
+Change `policy-data/thresholds.json`, then restart OPA so it reloads the mounted file (for example `docker compose -f template-output/docker-compose.yml -p swiftdeploy restart opa`), or recreate the container. **`deploy`** enforces **`infrastructure`**; **`promote stable`** (from canary) enforces **`canary`**.
+
+## Pre-Promote Testing Notes
+
+- The gate runs **only** for **canary → stable**.
+- Metrics are deltas over **`window_seconds`**. With **no** traffic, error rate can be **0** and the gate may pass despite a “broken” story—use realistic load for demos.
+- **Chaos** (`POST /chaos` with `mode: error`) stays on until **`{"mode":"recover"}`**. Even without a manual load generator, **Docker health checks** hit `/healthz`, and **`/metrics` scrapes** count as successful requests—so you can still see **non-zero** windowed error rates until you recover.
+- To force a **deny**: enable error chaos, add background `GET /` or rely on healthcheck + metrics mix, then `./swiftdeploy promote stable`.
+- To **pass** after a deny: `curl -X POST .../chaos -d '{"mode":"recover"}'`, then promote again.
 
 ## Command Behavior
 
-- `init`
-  - reads `manifest.yaml`
-  - generates `nginx.conf` and `docker-compose.yml` in output directory
-- `validate`
-  - runs 5 checks and exits non-zero on any failure:
-    1. manifest exists + valid YAML
-    2. required fields present/non-empty
-    3. app image exists locally
-    4. nginx host port is free
-    5. generated nginx config passes `nginx -t`
-- `deploy`
-  - runs init + validate
-  - starts stack with Compose
-  - waits for healthy `/healthz` up to manifest timeout
-- `promote <canary|stable>`
-  - updates `services.mode` in `manifest.yaml`
-  - regenerates compose config
-  - restarts app container only
-  - confirms mode via `/healthz` response header behavior
-- `teardown [--clean]`
-  - removes containers, network, and volumes for the stack
-  - with `--clean`, also removes generated config files
+- **`init`** — Reads `manifest.yaml`, writes `nginx.conf` and `docker-compose.yml` (includes OPA).
+- **`validate`** — (1) manifest YAML (2) required keys (3) image present (4) Nginx port free (5) `nginx -t` via container.
+- **`deploy`** — `init` → start **OPA** → **pre-deploy** gate → `validate` → `compose up` → wait for `/healthz` through Nginx.
+- **`promote <canary|stable>`** — If current mode is **canary** and target is **stable**, runs **pre-promote gate first** (does not change manifest until policy allows). Then updates `services.mode`, `init`, recreates **app** only, waits for health, checks `X-Mode` on `/healthz`.
+- **`status`** — Periodic metrics + policy snapshot; appends to `audit.history_file` (see manifest).
+- **`audit`** — Builds `audit.report_file` from history (run `status` at least once to create records).
+- **`teardown [--clean]`** — `compose down -v`; `--clean` removes generated compose and nginx files from the output directory.
 
 ## Troubleshooting
 
 ### Nginx port already in use
 
-If `./swiftdeploy validate` fails at check `4) nginx host port not already in use`:
-
 ```bash
 ss -ltnp | rg ":8080"
 ```
 
-Resolve with one of these:
+Stop the conflicting container or process, or change `nginx.port` in `manifest.yaml`, then `init` and `validate` again.
 
-1. Stop the conflicting process currently bound to the port:
+### Deploy blocked by infrastructure policy
 
-```bash
-# If it is a Docker container publishing 8080
-docker ps --format "{{.ID}}\t{{.Ports}}\t{{.Names}}" | rg "0.0.0.0:8080|:::8080"
-docker stop <container_id_or_name>
+Thresholds are too strict for this host (CPU load, free disk). Relax `policy-data/thresholds.json` or free resources, restart OPA if needed, then retry.
 
-# If it is a system service
-sudo systemctl stop <service-name>
+### Promote stable blocked by canary policy
 
-# If you only have a PID from ss output
-sudo kill <pid>
-```
+Clear chaos, ensure the window has acceptable error rate and p99 (see **Pre-Promote Testing Notes**). Shorten `window_seconds` temporarily for faster iteration.
 
-2. Change `nginx.port` in `manifest.yaml` to an unused port (for example `8081`), then rerun:
+### `audit` says history missing
 
-```bash
-./swiftdeploy init
-./swiftdeploy validate
-./swiftdeploy deploy
-```
+Run `./swiftdeploy status 5` (or another interval) while the stack and OPA are up so `history.jsonl` is created.
 
+## Checklist
+
+- `validate` output (all checks pass)
+- `deploy` output (including pre-deploy policy line)
+- `promote canary` then `promote stable` (or deny + recover flow) with pre-promote gate
+- Generated `nginx.conf` and `docker-compose.yml` snippets
+- Sample `curl` to `/metrics` through Nginx
+- Evidence that OPA is **not** exposed via the Nginx port (status code / body as above)
+- Optional: `audit_report.md` after running `status` + `audit`

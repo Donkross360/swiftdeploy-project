@@ -6,8 +6,13 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // chaosState tracks active chaos behavior across requests.
@@ -52,6 +57,31 @@ func (c *chaosState) snapshot() (string, time.Duration, float64) {
 	return c.mode, c.slowDuration, c.errorRate
 }
 
+func (c *chaosState) metricValue() float64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Keep gauge encoding explicit and stable for policy/status consumers:
+	// recover/none=0, slow=1, error=2.
+	switch c.mode {
+	case "slow":
+		return 1
+	case "error":
+		return 2
+	default:
+		return 0
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
 // main wires runtime config, endpoints, and server startup.
 func main() {
 	// Runtime behavior is controlled by environment so promote can switch mode
@@ -61,123 +91,176 @@ func main() {
 	port := getenvDefault("APP_PORT", "3000")
 	startedAt := time.Now()
 	chaos := &chaosState{mode: "recover"}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	mux := http.NewServeMux()
+	httpRequestsTotal := promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests handled by method, path, and status code.",
+		},
+		[]string{"method", "path", "status_code"},
+	)
+	// Keep request latency as histogram buckets so downstream tooling can compute P99.
+	httpRequestDurationSeconds := promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "Histogram of HTTP request latency in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+	// Expose process uptime as a live gauge function (seconds since startup).
+	appUptimeSeconds := promauto.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "app_uptime_seconds",
+			Help: "Uptime of the API process in seconds.",
+		},
+		func() float64 { return time.Since(startedAt).Seconds() },
+	)
+	_ = appUptimeSeconds
+	appMode := promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "app_mode",
+			Help: "Current mode where stable=0 and canary=1.",
+		},
+	)
+	chaosActive := promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "chaos_active",
+			Help: "Current chaos state where none=0, slow=1, error=2.",
+		},
+	)
+
+	if mode == "canary" {
+		appMode.Set(1)
+	} else {
+		appMode.Set(0)
+	}
+	chaosActive.Set(chaos.metricValue())
 
 	// Canary responses must always advertise canary mode.
-	withModeHeader := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
+	withModeHeader := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if mode == "canary" {
 				w.Header().Set("X-Mode", "canary")
 			}
-			next(w, r)
-		}
+			next.ServeHTTP(w, r)
+		})
 	}
 
-	// Root endpoint exposes deploy metadata used during stable/canary verification.
-	mux.HandleFunc("/", withModeHeader(func(w http.ResponseWriter, r *http.Request) {
-		if shouldFail := applyChaos(chaos, mode, rng); shouldFail {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"status":  "error",
-				"message": "chaos error mode triggered",
-			})
-			return
-		}
+	promHandler := promhttp.Handler()
 
-		writeJSON(w, http.StatusOK, map[string]any{
-			"message":   "welcome to swiftdeploy service",
-			"mode":      mode,
-			"version":   version,
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-		})
-	}))
-
-	// Health endpoint is the contract used by swiftdeploy readiness checks.
-	mux.HandleFunc("/healthz", withModeHeader(func(w http.ResponseWriter, r *http.Request) {
-		if shouldFail := applyChaos(chaos, mode, rng); shouldFail {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"status":  "error",
-				"message": "chaos error mode triggered",
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":         "ok",
-			"uptime_seconds": int(time.Since(startedAt).Seconds()),
-		})
-	}))
-
-	// Chaos endpoint enables controlled failure modes for rollout testing.
-	mux.HandleFunc("/chaos", withModeHeader(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{
-				"error": "method not allowed",
-			})
-			return
-		}
-
-		if mode != "canary" {
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error": "chaos endpoint is only active in canary mode",
-			})
-			return
-		}
-
-		var payload struct {
-			Mode     string  `json:"mode"`
-			Duration int     `json:"duration"`
-			Rate     float64 `json:"rate"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "invalid json payload",
-			})
-			return
-		}
-
-		switch payload.Mode {
-		case "slow":
-			if payload.Duration <= 0 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "duration must be > 0 for slow mode",
+	// Exact (method, path) routing: unknown paths get 404 (so OPA-ish URLs cannot hit the "/" JSON).
+	api := withModeHeader(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case r.Method == http.MethodGet && p == "/":
+			if shouldFail := applyChaos(chaos, mode); shouldFail {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"status":  "error",
+					"message": "chaos error mode triggered",
 				})
 				return
 			}
-			chaos.setSlow(payload.Duration)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"status":   "slow",
-				"duration": payload.Duration,
+				"message":   "welcome to swiftdeploy service",
+				"mode":      mode,
+				"version":   version,
+				"timestamp": time.Now().UTC().Format(time.RFC3339),
 			})
-		case "error":
-			if payload.Rate < 0 || payload.Rate > 1 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "rate must be between 0 and 1 for error mode",
+		case r.Method == http.MethodGet && p == "/healthz":
+			if shouldFail := applyChaos(chaos, mode); shouldFail {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"status":  "error",
+					"message": "chaos error mode triggered",
 				})
 				return
 			}
-			chaos.setError(payload.Rate)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"status": "error",
-				"rate":   payload.Rate,
+				"status":         "ok",
+				"uptime_seconds": int(time.Since(startedAt).Seconds()),
 			})
-		case "recover":
-			chaos.recover()
-			writeJSON(w, http.StatusOK, map[string]any{
-				"status": "recover",
-			})
+		case r.Method == http.MethodGet && p == "/metrics":
+			promHandler.ServeHTTP(w, r)
+		case r.Method == http.MethodPost && p == "/chaos":
+			if mode != "canary" {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "chaos endpoint is only active in canary mode",
+				})
+				return
+			}
+			var payload struct {
+				Mode     string  `json:"mode"`
+				Duration int     `json:"duration"`
+				Rate     float64 `json:"rate"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "invalid json payload",
+				})
+				return
+			}
+			switch payload.Mode {
+			case "slow":
+				if payload.Duration <= 0 {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": "duration must be > 0 for slow mode",
+					})
+					return
+				}
+				chaos.setSlow(payload.Duration)
+				chaosActive.Set(chaos.metricValue())
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status":   "slow",
+					"duration": payload.Duration,
+				})
+			case "error":
+				if payload.Rate < 0 || payload.Rate > 1 {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": "rate must be between 0 and 1 for error mode",
+					})
+					return
+				}
+				chaos.setError(payload.Rate)
+				chaosActive.Set(chaos.metricValue())
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status": "error",
+					"rate":   payload.Rate,
+				})
+			case "recover":
+				chaos.recover()
+				chaosActive.Set(chaos.metricValue())
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status": "recover",
+				})
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "mode must be one of: slow, error, recover",
+				})
+			}
 		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "mode must be one of: slow, error, recover",
-			})
+			http.NotFound(w, r)
 		}
 	}))
+
+	// Capture throughput/error/latency uniformly for every route response.
+	instrumentedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		recorder := &statusRecorder{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+		}
+
+		api.ServeHTTP(recorder, r)
+
+		path := r.URL.Path
+		httpRequestsTotal.WithLabelValues(r.Method, path, strconv.Itoa(recorder.statusCode)).Inc()
+		httpRequestDurationSeconds.WithLabelValues(r.Method, path).Observe(time.Since(start).Seconds())
+	})
 
 	// Keep server-level timeouts explicit to reduce slowloris-style risk.
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           mux,
+		Handler:           instrumentedMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -187,7 +270,7 @@ func main() {
 	}
 }
 
-func applyChaos(state *chaosState, mode string, rng *rand.Rand) bool {
+func applyChaos(state *chaosState, mode string) bool {
 	// Chaos behavior only activates in canary mode.
 	if mode != "canary" {
 		return false
@@ -202,7 +285,7 @@ func applyChaos(state *chaosState, mode string, rng *rand.Rand) bool {
 		if errorRate <= 0 {
 			return false
 		}
-		return rng.Float64() < errorRate
+		return rand.Float64() < errorRate
 	case "recover", "":
 		return false
 	default:

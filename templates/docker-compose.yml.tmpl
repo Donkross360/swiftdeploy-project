@@ -11,6 +11,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # Health endpoint gates nginx startup and deploy readiness.
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:{{APP_PORT}}/healthz >/dev/null 2>&1 || exit 1"]
       interval: 10s
@@ -24,14 +25,35 @@ services:
   nginx:
     image: {{NGINX_IMAGE}}
     container_name: swiftdeploy-nginx
+    # Nginx only starts after app health is green.
     depends_on:
       app:
         condition: service_healthy
     ports:
       - "{{NGINX_PORT}}:{{NGINX_PORT}}"
+    # Mount generated config from output directory and keep logs in named volume.
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - {{LOGS_VOLUME_NAME}}:/var/log/nginx
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: {{RESTART_POLICY}}
+    networks:
+      - {{NETWORK_NAME}}
+
+  opa:
+    image: {{OPA_IMAGE}}
+    container_name: swiftdeploy-opa
+    # OPA serves policy decisions from mounted rego + explicit data file.
+    command: ["run", "--server", "--addr=0.0.0.0:{{OPA_PORT}}", "/policies", "/policy-data/thresholds.json"]
+    ports:
+      # Bind only on localhost to keep OPA API off public ingress.
+      - "127.0.0.1:{{OPA_PORT}}:{{OPA_PORT}}"
+    volumes:
+      - ../policies:/policies:ro
+      - ../policy-data/thresholds.json:/policy-data/thresholds.json:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:

@@ -5,3 +5,9 @@ template-output/
 temp_output/
 *-generated/
 
+# Audit / observability loops (./swiftdeploy status + audit; rebuild anytime)
+audit_report.md
+history.jsonl
+
+# Local Go binaries if you compile outside Docker
+app/swift-api
