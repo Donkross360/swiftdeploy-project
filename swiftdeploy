@@ -400,13 +400,12 @@ metrics_snapshot_json() {
   metrics="$(curl -fsS --connect-timeout 2 --max-time "$timeout_seconds" "http://127.0.0.1:${nginx_port}/metrics" 2>/dev/null || true)"
   [[ -n "$metrics" ]] || die "unable to scrape /metrics from nginx endpoint"
 
-  python3 - <<'PY' <<<"$metrics"
+  python3 - <<'PY' "$metrics"
 import json
-import math
 import re
 import sys
 
-lines = sys.stdin.read().splitlines()
+lines = sys.argv[1].splitlines()
 total = 0.0
 errors = 0.0
 buckets = {}
@@ -450,7 +449,9 @@ if total_obs > 0:
 print(json.dumps({
     "total_requests": total,
     "error_requests": errors,
-    "p99_latency_ms": p99_seconds * 1000.0
+    "p99_latency_ms": p99_seconds * 1000.0,
+    "app_mode": 0 if "app_mode 1" not in "\n".join(lines) else 1,
+    "chaos_active": int(float(next((ln.split(" ", 1)[1] for ln in lines if ln.startswith("chaos_active ")), "0")))
 }))
 PY
 }
@@ -617,7 +618,7 @@ pre_deploy_gate() {
   local payload
   wait_for_opa_ready
   payload="$(collect_host_stats_json)"
-  if ! run_policy_gate "infrastructure" "/v1/data/infrastructure/decision" "$payload"; then
+  if ! run_policy_gate "infrastructure" "/v1/data/policy/infrastructure/decision" "$payload"; then
     die "deploy blocked by infrastructure policy"
   fi
 }
@@ -629,9 +630,367 @@ pre_promote_gate() {
   window_seconds="$(read_policy_window_seconds)"
   log "policy canary: collecting metrics window (${window_seconds}s)"
   payload="$(compute_canary_window_json "$window_seconds")"
-  if ! run_policy_gate "canary" "/v1/data/canary/decision" "$payload"; then
+  if ! run_policy_gate "canary" "/v1/data/policy/canary/decision" "$payload"; then
     die "promote blocked by canary policy"
   fi
+}
+
+policy_gate_status_json() {
+  local domain="$1" endpoint="$2" payload_json="$3"
+  local opa_port timeout_seconds url response
+  opa_port="$(manifest_get opa port)"
+  timeout_seconds="$(manifest_get policy decision_timeout_seconds)"
+  url="http://127.0.0.1:${opa_port}${endpoint}"
+
+  if ! response="$(curl -sS --connect-timeout 2 --max-time "$timeout_seconds" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    "$url" \
+    -d "{\"input\":${payload_json}}" 2>&1)"; then
+    printf '{"domain":"%s","allow":false,"status":"error","summary":"%s","violations":[]}' \
+      "$domain" "$(printf '%s' "$response" | tr '"' "'" | tr '\n' ' ')"
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '{"domain":"%s","allow":false,"status":"error","summary":"python3 required to parse policy response","violations":[]}' "$domain"
+    return 0
+  fi
+
+  python3 - <<'PY' "$domain" "$response"
+import json
+import sys
+
+domain = sys.argv[1]
+raw = sys.argv[2]
+try:
+    payload = json.loads(raw)
+except Exception as exc:
+    print(json.dumps({
+        "domain": domain,
+        "allow": False,
+        "status": "error",
+        "summary": f"invalid JSON from OPA: {exc}",
+        "violations": []
+    }))
+    raise SystemExit(0)
+
+result = payload.get("result")
+if not isinstance(result, dict):
+    print(json.dumps({
+        "domain": domain,
+        "allow": False,
+        "status": "error",
+        "summary": f"missing result object in OPA response: {json.dumps(payload, sort_keys=True)}",
+        "violations": []
+    }))
+    raise SystemExit(0)
+
+allow = bool(result.get("allow"))
+summary = result.get("summary", "")
+violations = result.get("violations", [])
+if not isinstance(violations, list):
+    violations = []
+
+print(json.dumps({
+    "domain": domain,
+    "allow": allow,
+    "status": "ok",
+    "summary": summary,
+    "violations": violations
+}))
+PY
+}
+
+resolve_history_file_path() {
+  local history_file
+  history_file="$(manifest_get audit history_file)"
+  if [[ "$history_file" = /* ]]; then
+    printf '%s' "$history_file"
+  else
+    printf '%s/%s' "$SCRIPT_DIR" "$history_file"
+  fi
+}
+
+resolve_report_file_path() {
+  local report_file
+  report_file="$(manifest_get audit report_file)"
+  if [[ "$report_file" = /* ]]; then
+    printf '%s' "$report_file"
+  else
+    printf '%s/%s' "$SCRIPT_DIR" "$report_file"
+  fi
+}
+
+status_cmd() {
+  local interval_seconds="${1:-2}"
+  [[ "$interval_seconds" =~ ^[0-9]+$ ]] || die "status interval must be an integer number of seconds"
+  (( interval_seconds > 0 )) || die "status interval must be greater than zero"
+
+  local history_file history_dir window_seconds
+  history_file="$(resolve_history_file_path)"
+  history_dir="$(dirname "$history_file")"
+  mkdir -p "$history_dir"
+  window_seconds="$(read_policy_window_seconds)"
+
+  local prev_snapshot
+  prev_snapshot="$(metrics_snapshot_json)"
+  local prev_ts
+  prev_ts="$(date +%s)"
+
+  while true; do
+    local now_ts snapshot req_per_s error_rate p99_latency_ms app_mode chaos_active
+    now_ts="$(date +%s)"
+    snapshot="$(metrics_snapshot_json)"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+      die "python3 command not found (required for status calculations)"
+    fi
+
+    local calculated
+    calculated="$(python3 - <<'PY' "$prev_snapshot" "$snapshot" "$prev_ts" "$now_ts" "$window_seconds"
+import json
+import sys
+
+prev = json.loads(sys.argv[1])
+curr = json.loads(sys.argv[2])
+prev_ts = int(sys.argv[3])
+now_ts = int(sys.argv[4])
+window = int(sys.argv[5])
+
+delta_t = max(1, now_ts - prev_ts)
+delta_total = max(0.0, curr["total_requests"] - prev["total_requests"])
+delta_errors = max(0.0, curr["error_requests"] - prev["error_requests"])
+req_per_s = delta_total / float(delta_t)
+error_rate = 0.0 if delta_total == 0 else delta_errors / delta_total
+
+print(json.dumps({
+    "req_per_s": req_per_s,
+    "error_rate": error_rate,
+    "p99_latency_ms": curr["p99_latency_ms"],
+    "app_mode": curr["app_mode"],
+    "chaos_active": curr["chaos_active"],
+    "window_seconds": window
+}))
+PY
+)"
+
+    req_per_s="$(python3 - <<'PY' "$calculated"
+import json,sys
+print(f"{json.loads(sys.argv[1])['req_per_s']:.2f}")
+PY
+)"
+    error_rate="$(python3 - <<'PY' "$calculated"
+import json,sys
+print(f"{json.loads(sys.argv[1])['error_rate']:.5f}")
+PY
+)"
+    p99_latency_ms="$(python3 - <<'PY' "$calculated"
+import json,sys
+print(f"{json.loads(sys.argv[1])['p99_latency_ms']:.2f}")
+PY
+)"
+    app_mode="$(python3 - <<'PY' "$calculated"
+import json,sys
+print("canary" if int(json.loads(sys.argv[1])["app_mode"]) == 1 else "stable")
+PY
+)"
+    chaos_active="$(python3 - <<'PY' "$calculated"
+import json,sys
+mapping = {0: "none", 1: "slow", 2: "error"}
+print(mapping.get(int(json.loads(sys.argv[1])["chaos_active"]), "unknown"))
+PY
+)"
+
+    local infra_payload canary_payload infra_policy canary_policy
+    infra_payload="$(collect_host_stats_json)"
+    canary_payload="$(python3 - <<'PY' "$calculated"
+import json,sys
+c = json.loads(sys.argv[1])
+print(json.dumps({
+    "context": "pre-promote",
+    "window_seconds": c["window_seconds"],
+    "error_rate": c["error_rate"],
+    "p99_latency_ms": c["p99_latency_ms"]
+}))
+PY
+)"
+
+    infra_policy="$(policy_gate_status_json "infrastructure" "/v1/data/policy/infrastructure/decision" "$infra_payload")"
+    canary_policy="$(policy_gate_status_json "canary" "/v1/data/policy/canary/decision" "$canary_payload")"
+
+    clear
+    printf 'SwiftDeploy Status (refresh: %ss)\n' "$interval_seconds"
+    printf 'Timestamp: %s\n' "$(date -Iseconds)"
+    printf 'Mode: %s | Chaos: %s\n' "$app_mode" "$chaos_active"
+    printf 'req/s: %s | error_rate: %s | p99_latency_ms: %s\n' "$req_per_s" "$error_rate" "$p99_latency_ms"
+    printf '\nPolicy Compliance:\n'
+    python3 - <<'PY' "$infra_policy" "$canary_policy"
+import json
+import sys
+
+for raw in sys.argv[1:]:
+    d = json.loads(raw)
+    status = "PASS" if d.get("allow") else "FAIL"
+    if d.get("status") == "error":
+        status = "ERROR"
+    print(f"- {d.get('domain')}: {status} - {d.get('summary', '')}")
+PY
+
+    python3 - <<'PY' "$history_file" "$req_per_s" "$error_rate" "$p99_latency_ms" "$app_mode" "$chaos_active" "$infra_policy" "$canary_policy"
+import json
+import sys
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+record = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "mode": sys.argv[5],
+    "chaos_active": sys.argv[6],
+    "req_per_s": float(sys.argv[2]),
+    "error_rate": float(sys.argv[3]),
+    "p99_latency_ms": float(sys.argv[4]),
+    "policies": {
+        "infrastructure": json.loads(sys.argv[7]),
+        "canary": json.loads(sys.argv[8]),
+    },
+}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(record, sort_keys=True) + "\n")
+PY
+
+    prev_snapshot="$snapshot"
+    prev_ts="$now_ts"
+    sleep "$interval_seconds"
+  done
+}
+
+audit_cmd() {
+  local history_file report_file report_dir
+  history_file="$(resolve_history_file_path)"
+  report_file="$(resolve_report_file_path)"
+  report_dir="$(dirname "$report_file")"
+  mkdir -p "$report_dir"
+
+  [[ -f "$history_file" ]] || die "history file not found: $history_file (run ./swiftdeploy status first)"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    die "python3 command not found (required for audit report generation)"
+  fi
+
+  python3 - <<'PY' "$history_file" "$report_file"
+import json
+import pathlib
+import sys
+
+history_path = pathlib.Path(sys.argv[1])
+report_path = pathlib.Path(sys.argv[2])
+
+records = []
+for line in history_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        records.append(json.loads(line))
+    except Exception:
+        continue
+
+if not records:
+    raise SystemExit("history file has no parseable records")
+
+timeline_rows = []
+violations = []
+
+prev_mode = None
+prev_chaos = None
+
+for rec in records:
+    ts = rec.get("timestamp", "")
+    mode = rec.get("mode", "unknown")
+    chaos = rec.get("chaos_active", "unknown")
+
+    events = []
+    if prev_mode is None or mode != prev_mode:
+        events.append(f"mode->{mode}")
+    if prev_chaos is None or chaos != prev_chaos:
+        events.append(f"chaos->{chaos}")
+    if events:
+        timeline_rows.append({
+            "timestamp": ts,
+            "event": ", ".join(events),
+            "mode": mode,
+            "chaos": chaos,
+            "req_per_s": rec.get("req_per_s", 0.0),
+            "error_rate": rec.get("error_rate", 0.0),
+            "p99_latency_ms": rec.get("p99_latency_ms", 0.0),
+        })
+
+    policies = rec.get("policies", {})
+    for domain, result in policies.items():
+        allow = bool(result.get("allow"))
+        status = result.get("status", "ok")
+        summary = result.get("summary", "")
+        if (not allow) or status != "ok":
+            violations.append({
+                "timestamp": ts,
+                "domain": domain,
+                "summary": summary,
+                "status": status,
+                "violations": result.get("violations", []),
+            })
+
+    prev_mode = mode
+    prev_chaos = chaos
+
+lines = []
+lines.append("# Audit Report")
+lines.append("")
+lines.append(f"- Source history: `{history_path}`")
+lines.append(f"- Records parsed: **{len(records)}**")
+lines.append("")
+lines.append("## Timeline")
+lines.append("")
+lines.append("| Timestamp | Event | Mode | Chaos | req/s | Error Rate | P99 Latency (ms) |")
+lines.append("|---|---|---|---|---:|---:|---:|")
+for row in timeline_rows:
+    lines.append(
+        f"| {row['timestamp']} | {row['event']} | {row['mode']} | {row['chaos']} | "
+        f"{float(row['req_per_s']):.2f} | {float(row['error_rate']):.5f} | {float(row['p99_latency_ms']):.2f} |"
+    )
+if not timeline_rows:
+    lines.append("| - | no mode/chaos transitions captured | - | - | - | - | - |")
+
+lines.append("")
+lines.append("## Policy Violations")
+lines.append("")
+if violations:
+    lines.append("| Timestamp | Domain | Status | Summary |")
+    lines.append("|---|---|---|---|")
+    for v in violations:
+        lines.append(f"| {v['timestamp']} | {v['domain']} | {v['status']} | {v['summary']} |")
+        details = v.get("violations", [])
+        if details:
+            for item in details:
+                if isinstance(item, dict):
+                    msg = item.get("message", json.dumps(item, sort_keys=True))
+                else:
+                    msg = str(item)
+                lines.append(f"|  |  |  | ↳ {msg} |")
+else:
+    lines.append("No policy violations were recorded in `history.jsonl`.")
+
+lines.append("")
+lines.append("## Notes")
+lines.append("")
+lines.append("- Timeline records mode and chaos transitions observed in status samples.")
+lines.append("- Violations include both explicit deny decisions and policy query errors.")
+lines.append("")
+
+report_path.write_text("\n".join(lines), encoding="utf-8")
+PY
+
+  log "audit complete: generated ${report_file}"
 }
 
 update_manifest_mode() {
@@ -887,8 +1246,14 @@ case "$cmd" in
   teardown)
     teardown_cmd "$subarg"
     ;;
+  status)
+    status_cmd "$subarg"
+    ;;
+  audit)
+    audit_cmd
+    ;;
   *)
-    echo "Usage: ./swiftdeploy {init|validate|build|deploy|promote <stable|canary>|teardown [--clean]}"
+    echo "Usage: ./swiftdeploy {init|validate|build|deploy|promote <stable|canary>|status [interval_seconds]|audit|teardown [--clean]}"
     exit 1
     ;;
 esac

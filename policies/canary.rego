@@ -1,6 +1,8 @@
-package canary
+package policy.canary
 
 import rego.v1
+
+default allow := false
 
 # Canary domain answers one question:
 # "Is it safe to proceed with pre-promote based on canary health?"
@@ -17,34 +19,34 @@ violations contains v if {
 
 violations contains v if {
   # Ensure promote decision uses the expected observation window.
-  input.window_seconds != data.thresholds.canary.window_seconds
+  input.window_seconds != data.canary.window_seconds
   v := {
     "code": "WINDOW_MISMATCH",
-    "message": sprintf("metrics window %d seconds does not match required %d seconds", [input.window_seconds, data.thresholds.canary.window_seconds]),
+    "message": sprintf("metrics window %v seconds does not match required %v seconds", [input.window_seconds, data.canary.window_seconds]),
     "actual": input.window_seconds,
-    "threshold": data.thresholds.canary.window_seconds
+    "threshold": data.canary.window_seconds
   }
 }
 
 violations contains v if {
   # Block promotion when observed error rate exceeds configured threshold.
-  input.error_rate > data.thresholds.canary.max_error_rate
+  input.error_rate > data.canary.max_error_rate
   v := {
     "code": "HIGH_ERROR_RATE",
-    "message": sprintf("error rate %.5f exceeds maximum %.5f", [input.error_rate, data.thresholds.canary.max_error_rate]),
+    "message": sprintf("error rate %v exceeds maximum %v", [input.error_rate, data.canary.max_error_rate]),
     "actual": input.error_rate,
-    "threshold": data.thresholds.canary.max_error_rate
+    "threshold": data.canary.max_error_rate
   }
 }
 
 violations contains v if {
   # Block promotion when p99 latency exceeds configured threshold.
-  input.p99_latency_ms > data.thresholds.canary.max_p99_latency_ms
+  input.p99_latency_ms > data.canary.max_p99_latency_ms
   v := {
     "code": "HIGH_P99_LATENCY",
-    "message": sprintf("p99 latency %.2fms exceeds maximum %.2fms", [input.p99_latency_ms, data.thresholds.canary.max_p99_latency_ms]),
+    "message": sprintf("p99 latency %vms exceeds maximum %vms", [input.p99_latency_ms, data.canary.max_p99_latency_ms]),
     "actual": input.p99_latency_ms,
-    "threshold": data.thresholds.canary.max_p99_latency_ms
+    "threshold": data.canary.max_p99_latency_ms
   }
 }
 
@@ -60,9 +62,11 @@ summary := sprintf("canary policy denied with %d violation(s)", [count(violation
   not allow
 }
 
+violation_list := [v | some v in violations]
+
 decision := {
   "allow": allow,
-  "violations": [v | v := violations[_]],
+  "violations": violation_list,
   "summary": summary,
   "domain": "canary"
 }

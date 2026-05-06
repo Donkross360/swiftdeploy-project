@@ -46,14 +46,14 @@ services:
   opa:
     image: {{OPA_IMAGE}}
     container_name: swiftdeploy-opa
-    # OPA serves policy decisions from mounted rego + data directories.
-    command: ["run", "--server", "--addr=0.0.0.0:{{OPA_PORT}}", "/policies", "/policy-data"]
+    # OPA serves policy decisions from mounted rego + explicit data file.
+    command: ["run", "--server", "--addr=0.0.0.0:{{OPA_PORT}}", "/policies", "/policy-data/thresholds.json"]
     ports:
       # Bind only on localhost to keep OPA API off public ingress.
       - "127.0.0.1:{{OPA_PORT}}:{{OPA_PORT}}"
     volumes:
       - ../policies:/policies:ro
-      - ../policy-data:/policy-data:ro
+      - ../policy-data/thresholds.json:/policy-data/thresholds.json:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:

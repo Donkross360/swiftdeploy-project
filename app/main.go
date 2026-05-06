@@ -137,8 +137,6 @@ func main() {
 	}
 	chaosActive.Set(chaos.metricValue())
 
-	mux := http.NewServeMux()
-
 	// Canary responses must always advertise canary mode.
 	withModeHeader := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -149,112 +147,100 @@ func main() {
 		})
 	}
 
-	// Root endpoint exposes deploy metadata used during stable/canary verification.
-	mux.Handle("/", withModeHeader(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if shouldFail := applyChaos(chaos, mode); shouldFail {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"status":  "error",
-				"message": "chaos error mode triggered",
-			})
-			return
-		}
+	promHandler := promhttp.Handler()
 
-		writeJSON(w, http.StatusOK, map[string]any{
-			"message":   "welcome to swiftdeploy service",
-			"mode":      mode,
-			"version":   version,
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-		})
-	})))
-
-	// Health endpoint is the contract used by swiftdeploy readiness checks.
-	mux.Handle("/healthz", withModeHeader(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if shouldFail := applyChaos(chaos, mode); shouldFail {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"status":  "error",
-				"message": "chaos error mode triggered",
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":         "ok",
-			"uptime_seconds": int(time.Since(startedAt).Seconds()),
-		})
-	})))
-
-	mux.Handle("/metrics", withModeHeader(promhttp.Handler()))
-
-	// Chaos endpoint enables controlled failure modes for rollout testing.
-	mux.Handle("/chaos", withModeHeader(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{
-				"error": "method not allowed",
-			})
-			return
-		}
-
-		if mode != "canary" {
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error": "chaos endpoint is only active in canary mode",
-			})
-			return
-		}
-
-		var payload struct {
-			Mode     string  `json:"mode"`
-			Duration int     `json:"duration"`
-			Rate     float64 `json:"rate"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "invalid json payload",
-			})
-			return
-		}
-
-		switch payload.Mode {
-		case "slow":
-			if payload.Duration <= 0 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "duration must be > 0 for slow mode",
+	// Exact (method, path) routing: unknown paths get 404 (so OPA-ish URLs cannot hit the "/" JSON).
+	api := withModeHeader(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case r.Method == http.MethodGet && p == "/":
+			if shouldFail := applyChaos(chaos, mode); shouldFail {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"status":  "error",
+					"message": "chaos error mode triggered",
 				})
 				return
 			}
-			chaos.setSlow(payload.Duration)
-			// Reflect runtime chaos transition in the exported gauge immediately.
-			chaosActive.Set(chaos.metricValue())
 			writeJSON(w, http.StatusOK, map[string]any{
-				"status":   "slow",
-				"duration": payload.Duration,
+				"message":   "welcome to swiftdeploy service",
+				"mode":      mode,
+				"version":   version,
+				"timestamp": time.Now().UTC().Format(time.RFC3339),
 			})
-		case "error":
-			if payload.Rate < 0 || payload.Rate > 1 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "rate must be between 0 and 1 for error mode",
+		case r.Method == http.MethodGet && p == "/healthz":
+			if shouldFail := applyChaos(chaos, mode); shouldFail {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"status":  "error",
+					"message": "chaos error mode triggered",
 				})
 				return
 			}
-			chaos.setError(payload.Rate)
-			// Error mode is tracked as numeric state 2 in chaos_active.
-			chaosActive.Set(chaos.metricValue())
 			writeJSON(w, http.StatusOK, map[string]any{
-				"status": "error",
-				"rate":   payload.Rate,
+				"status":         "ok",
+				"uptime_seconds": int(time.Since(startedAt).Seconds()),
 			})
-		case "recover":
-			chaos.recover()
-			// Recover returns chaos_active to 0 (no active chaos behavior).
-			chaosActive.Set(chaos.metricValue())
-			writeJSON(w, http.StatusOK, map[string]any{
-				"status": "recover",
-			})
+		case r.Method == http.MethodGet && p == "/metrics":
+			promHandler.ServeHTTP(w, r)
+		case r.Method == http.MethodPost && p == "/chaos":
+			if mode != "canary" {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "chaos endpoint is only active in canary mode",
+				})
+				return
+			}
+			var payload struct {
+				Mode     string  `json:"mode"`
+				Duration int     `json:"duration"`
+				Rate     float64 `json:"rate"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "invalid json payload",
+				})
+				return
+			}
+			switch payload.Mode {
+			case "slow":
+				if payload.Duration <= 0 {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": "duration must be > 0 for slow mode",
+					})
+					return
+				}
+				chaos.setSlow(payload.Duration)
+				chaosActive.Set(chaos.metricValue())
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status":   "slow",
+					"duration": payload.Duration,
+				})
+			case "error":
+				if payload.Rate < 0 || payload.Rate > 1 {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": "rate must be between 0 and 1 for error mode",
+					})
+					return
+				}
+				chaos.setError(payload.Rate)
+				chaosActive.Set(chaos.metricValue())
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status": "error",
+					"rate":   payload.Rate,
+				})
+			case "recover":
+				chaos.recover()
+				chaosActive.Set(chaos.metricValue())
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status": "recover",
+				})
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "mode must be one of: slow, error, recover",
+				})
+			}
 		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "mode must be one of: slow, error, recover",
-			})
+			http.NotFound(w, r)
 		}
-	})))
+	}))
 
 	// Capture throughput/error/latency uniformly for every route response.
 	instrumentedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +250,7 @@ func main() {
 			statusCode:     http.StatusOK,
 		}
 
-		mux.ServeHTTP(recorder, r)
+		api.ServeHTTP(recorder, r)
 
 		path := r.URL.Path
 		httpRequestsTotal.WithLabelValues(r.Method, path, strconv.Itoa(recorder.statusCode)).Inc()

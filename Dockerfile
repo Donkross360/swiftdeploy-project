@@ -5,7 +5,8 @@ WORKDIR /src
 COPY app/go.mod ./
 COPY app/ ./
 # Tidy in build stage to keep module locks reproducible in CI/container builds.
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/swift-api ./main.go
+# Omit GOARCH so the binary matches the builder image (works on amd64 and arm64 hosts).
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o /out/swift-api ./main.go
 
 # Runtime stage keeps final image small and non-root.
 FROM alpine:3.20
