@@ -2,6 +2,11 @@
 
 `swiftdeploy` is a manifest-driven deployment CLI for a Go API behind Nginx, extended with Prometheus metrics and Open Policy Agent (OPA) gates plus a lightweight audit trail.
 
+## Architecture Overview
+
+![SwiftDeploy architecture](./swiftdeploy-architecture.png)
+
+
 ## Prerequisites
 
 Required to run CLI workflows:
